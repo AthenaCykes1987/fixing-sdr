@@ -17,12 +17,14 @@
 
 import asyncio
 import re
+from time import localtime, strftime
 from enum import Enum
 
 from server import commands
 from server import logger
 from server.exceptions import ClientError, AreaError, ArgumentError, ServerError
 from server.fantacrypt import fanta_decrypt
+from server.evidence import Evidence
 
 
 class AOProtocol(asyncio.Protocol):
@@ -138,6 +140,9 @@ class AOProtocol(asyncio.Protocol):
         if self.server.ban_manager.is_banned(self.client.get_ip()):
             self.client.disconnect()
             return
+        if self.server.ban_manager.is_hdidbanned(self.client.get_hdid()):
+            self.client.disconnect()
+            return
         logger.log_server('Connected. HDID: {}.'.format(self.client.hdid), self.client)
         self.client.send_command('ID', self.client.id, self.server.software, self.server.get_version_string())
         self.client.send_command('PN', self.server.get_player_count() - 1, self.server.config['playerlimit'])
@@ -176,7 +181,7 @@ class AOProtocol(asyncio.Protocol):
 
         self.client.is_ao2 = True
 
-        self.client.send_command('FL', 'yellowtext', 'customobjections', 'flipping', 'fastloading', 'noencryption', 'deskmod')
+        self.client.send_command('FL', 'yellowtext', 'customobjections', 'flipping', 'fastloading', 'noencryption', 'deskmod', 'evidence')
 
     def net_cmd_ch(self, _):
         """ Periodically checks the connection.
@@ -240,6 +245,7 @@ class AOProtocol(asyncio.Protocol):
             self.client.send_command('EM', *self.server.music_pages_ao1[args[0]])
         else:
             self.client.send_done()
+            self.client.send_area_list()
             self.client.send_motd()
 
     def net_cmd_rc(self, _):
@@ -269,6 +275,7 @@ class AOProtocol(asyncio.Protocol):
         """
 
         self.client.send_done()
+        self.client.send_area_list()
         self.client.send_motd()
 
     def net_cmd_cc(self, args):
@@ -302,7 +309,7 @@ class AOProtocol(asyncio.Protocol):
                                      self.ArgType.INT, self.ArgType.INT, self.ArgType.INT, self.ArgType.INT,
                                      self.ArgType.INT, self.ArgType.INT, self.ArgType.INT):
             return
-        msg_type, pre, folder, anim, text, pos, sfx, anim_type, cid, sfx_delay, button, unk, flip, ding, color = args
+        msg_type, pre, folder, anim, text, pos, sfx, anim_type, cid, sfx_delay, button, evidence, flip, ding, color = args
         if msg_type not in ('chat', '0', '1'):
             return
         if anim_type not in (0, 1, 2, 5, 6):
@@ -313,10 +320,21 @@ class AOProtocol(asyncio.Protocol):
             return
         if button not in (0, 1, 2, 3, 4):
             return
+        if evidence < 0:
+        	return
         if ding not in (0, 1):
             return
         if color not in (0, 1, 2, 3, 4, 5, 6):
             return
+        if color == 2 and not self.client.is_mod:
+            color = 0
+        if color == 6:
+            text = re.sub(r'[^\x00-\x7F]+',' ', text) #remove all unicode to prevent redtext abuse
+            if len(text.strip( ' ' )) == 1:
+                color = 0
+            else:
+                if text.strip( ' ' ) in ('<num>', '<percent>', '<dollar>', '<and>'):
+                    color = 0
         if self.client.pos:
             pos = self.client.pos
         else:
@@ -324,9 +342,12 @@ class AOProtocol(asyncio.Protocol):
                 return
         msg = text[:256]
         self.client.area.send_command('MS', msg_type, pre, folder, anim, msg, pos, sfx, anim_type, cid,
-                                      sfx_delay, button, unk, flip, ding, color)
+                                      sfx_delay, button, evidence, flip, ding, color)
         self.client.area.set_next_msg_delay(len(msg))
         logger.log_server('[IC][{}][{}]{}'.format(self.client.area.id, self.client.get_char_name(), msg), self.client)
+
+        if (self.client.area.is_recording):
+        	self.client.area.recorded_messages.append(args)
 
     def net_cmd_ct(self, args):
         """ OOC Message
@@ -334,6 +355,9 @@ class AOProtocol(asyncio.Protocol):
         CT#<name:string>#<message:string>#%
 
         """
+        if self.client.is_ooc_muted:  # Checks to see if the client has been muted by a mod
+            self.client.send_host_message("You have been muted by a moderator")
+            return
         if not self.validate_net_cmd(args, self.ArgType.STR, self.ArgType.STR):
             return
         if self.client.name == '':
@@ -425,6 +449,47 @@ class AOProtocol(asyncio.Protocol):
         except AreaError:
             return
 
+    def net_cmd_pe(self, args):
+        """ Adds a piece of evidence.
+
+        PE#<name: string>#<description: string>#<image: string>#%
+
+        """
+
+        if len(args) < 3:
+            return
+
+        evi = Evidence(args[0], args[1], args[2])
+
+        self.client.area.add_evidence(evi)
+        self.client.area.broadcast_evidence_list()
+
+    def net_cmd_de(self, args):
+        """ Deletes a piece of evidence.
+
+        DE#<id: int>#%
+
+        """
+
+        self.client.area.delete_evidence(int(args[0]))
+        self.client.area.broadcast_evidence_list()
+
+    def net_cmd_ee(self, args):
+        """ Edits a piece of evidence.
+
+        EE#<id: int>#<name: string>#<description: string>#<image: string>#%
+
+        """
+
+        if len(args) < 4:
+            return
+
+        evi = Evidence(args[1], args[2], args[3])
+
+        self.client.area.edit_evidence(int(args[0]), evi)
+        self.client.area.broadcast_evidence_list()
+
+
     def net_cmd_zz(self, _):
         """ Sent on mod call.
 
@@ -437,10 +502,13 @@ class AOProtocol(asyncio.Protocol):
             self.client.send_host_message("You must wait 30 seconds between mod calls.")
             return
 
-        self.server.send_all_cmd_pred('ZZ', '{} ({}) in {} ({})'
-                                      .format(self.client.get_char_name(), self.client.get_ip(), self.client.area.name,
+        current_time = strftime("%H:%M", localtime())
+
+        self.server.send_all_cmd_pred('ZZ', '[{}] {} ({}) in {} ({})'
+                                      .format(current_time, self.client.get_char_name(), self.client.get_ip(), self.client.area.name,
                                               self.client.area.id), pred=lambda c: c.is_mod)
-        logger.log_server('[{}]{} called a moderator.'.format(self.client.area.id, self.client.get_char_name()))
+        self.client.set_mod_call_delay()
+        logger.log_server('[{}][{}]{} called a moderator.'.format(self.client.get_ip(), self.client.area.id, self.client.get_char_name()))
 
     def net_cmd_opKICK(self, args):
         self.net_cmd_ct(['opkick', '/kick {}'.format(args[0])])
@@ -466,6 +534,9 @@ class AOProtocol(asyncio.Protocol):
         'MC': net_cmd_mc,  # play song
         'RT': net_cmd_rt,  # WT/CE buttons
         'HP': net_cmd_hp,  # penalties
+        'PE': net_cmd_pe,  # add evidence
+        'DE': net_cmd_de,  # delete evidence
+        'EE': net_cmd_ee,  # edit evidence
         'ZZ': net_cmd_zz,  # call mod button
         'opKICK': net_cmd_opKICK,  # /kick with guard on
         'opBAN': net_cmd_opBAN,  # /ban with guard on
