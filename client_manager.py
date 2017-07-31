@@ -19,6 +19,8 @@ from server import fantacrypt
 from server import logger
 from server.exceptions import ClientError, AreaError
 
+import time
+
 
 class ClientManager:
     class Client:
@@ -31,13 +33,13 @@ class ClientManager:
             self.server = server
             self.name = ''
             self.is_mod = False
-            self.is_rpgm1 = False
-            self.is_rpgm2 = False
-            self.is_rpgm3 = False
             self.pos = ''
             self.muted_global = False
             self.muted_adverts = False
             self.is_muted = False
+            self.is_ooc_muted = False
+            self.pm_mute = False
+            self.mod_call_time = 0
             self.in_rp = False
 
         def send_raw_message(self, msg):
@@ -78,7 +80,7 @@ class ClientManager:
         def change_area(self, area):
             if self.area == area:
                 raise ClientError('You are already in this area.')
-            if area.is_locked and not self.is_mod and not self.is_rpgm1 and not self.is_rpgm2 and not self.is_rpgm3:
+            if area.is_locked and not self.is_mod:
                 self.send_host_message("That area is locked!")
                 return
             old_area = self.area
@@ -95,13 +97,14 @@ class ClientManager:
             self.area = area
             area.new_client(self)
 
-            self.send_host_message('Changed area to {}.'.format(area.name))
+            self.send_host_message('Changed area to {}.[{}]'.format(area.name, self.area.status))
             logger.log_server(
                 '[{}]Changed area from {} ({}) to {} ({}).'.format(self.get_char_name(), old_area.name, old_area.id,
                                                                    self.area.name, self.area.id), self)
             self.send_command('HP', 1, self.area.hp_def)
             self.send_command('HP', 2, self.area.hp_pro)
             self.send_command('BN', self.area.background)
+            self.send_command('LE', *self.area.get_evidence_list())
 
         def send_area_list(self):
             msg = '=== Areas ==='
@@ -132,8 +135,6 @@ class ClientManager:
             sorted_clients = sorted(area.clients, key=lambda x: x.get_char_name())
             for c in sorted_clients:
                 info += '\r\n{}'.format(c.get_char_name())
-                if self.is_mod:
-                    info += ' ({})'.format(c.get_ip())
             return info
 
         def send_area_info(self, area_id):
@@ -146,9 +147,39 @@ class ClientManager:
         def send_all_area_info(self):
             info = '== Area List =='
             for i in range(len(self.server.area_manager.areas)):
-                info += '\r\n{}'.format(self.get_area_info(i))
+                #print(len(i.clients))
+                if len(self.server.area_manager.areas[i].clients) > 0:
+                    info += '\r\n{}'.format(self.get_area_info(i))
             self.send_host_message(info)
 
+        def send_area_hdid(self, area_id):
+            try:
+                info = self.get_area_hdid(area_id)
+            except AreaError:
+                raise
+            self.send_host_message(info)				
+
+        def send_all_area_hdid(self):
+            info = '== HDID List =='
+            for i in range (len(self.server.area_manager.areas)):
+                 if len(self.server.area_manager.areas[i].clients) > 0:
+                    info += '\r\n{}'.format(self.get_area_hdid(i))
+            self.send_host_message(info)
+
+        def send_area_ip(self, area_id):
+            try:
+                info = self.get_area_ip(area_id)
+            except AreaError:
+                raise
+            self.send_host_message(info)				
+
+        def send_all_area_ip(self):
+            info = '== IP List =='
+            for i in range (len(self.server.area_manager.areas)):
+                 if len(self.server.area_manager.areas[i].clients) > 0:
+                    info += '\r\n{}'.format(self.get_area_ip(i))
+            self.send_host_message(info)
+			
         def send_done(self):
             avail_char_ids = set(range(len(self.server.char_list))) - set([x.char_id for x in self.area.clients])
             char_list = [-1] * len(self.server.char_list)
@@ -158,6 +189,7 @@ class ClientManager:
             self.send_command('HP', 1, self.area.hp_def)
             self.send_command('HP', 2, self.area.hp_pro)
             self.send_command('BN', self.area.background)
+            self.send_command('LE', *self.area.get_evidence_list())
             self.send_command('MM', 1)
             self.send_command('OPPASS', fantacrypt.fanta_encrypt(self.server.config['guardpass']))
             self.send_command('DONE')
@@ -173,34 +205,41 @@ class ClientManager:
                 self.is_mod = True
             else:
                 raise ClientError('Invalid password.')
-				
-        def auth_rpgm1(self, password):
-            if self.is_rpgm1:
-                raise ClientError('Already logged in.')
-            if password == self.server.config['rpgm1pass']:
-                self.is_mod = True
-            else:
-                raise ClientError('Invalid password.')
-				
-        def auth_rpgm2(self, password):
-            if self.is_rpgm2:
-                raise ClientError('Already logged in.')
-            if password == self.server.config['rpgm2pass']:
-                self.is_mod = True
-            else:
-                raise ClientError('Invalid password.')
-				
-        def auth_rpgm3(self, password):
-            if self.is_rpgm3:
-                raise ClientError('Already logged in.')
-            if password == self.server.config['rpgm3pass']:
-                self.is_mod = True
-            else:
-                raise ClientError('Invalid password.')
-				
+
         def get_ip(self):
             return self.transport.get_extra_info('peername')[0]
 
+        def get_hdid(self):
+            return self.hdid
+
+        def get_area_hdid(self, area_id):
+            info = ''
+            try:
+                area = self.server.area_manager.get_area_by_id(area_id)
+            except AreaError:
+                raise
+            info += '= Area {}: {} =='.format(area.id, area.name)
+            sorted_clients = sorted(area.clients, key=lambda x: x.get_char_name())
+            for c in sorted_clients:
+                info += '\r\n{}'.format(c.get_char_name())
+                if self.is_mod:
+                    info += ' ({})'.format(c.get_hdid())
+            return info
+		
+        def get_area_ip(self, area_id):
+            info = ''
+            try:
+                area = self.server.area_manager.get_area_by_id(area_id)
+            except AreaError:
+                raise
+            info += '= Area {}: {} =='.format(area.id, area.name)
+            sorted_clients = sorted(area.clients, key=lambda x: x.get_char_name())
+            for c in sorted_clients:
+                info += '\r\n{}'.format(c.get_char_name())
+                if self.is_mod:
+                    info += ' ({})'.format(c.get_ip())
+            return info
+		
         def get_char_name(self):
             if self.char_id == -1:
                 return 'CHAR_SELECT'
@@ -210,6 +249,12 @@ class ClientManager:
             if pos not in ('', 'def', 'pro', 'hld', 'hlp', 'jud', 'wit'):
                 raise ClientError('Invalid position. Possible values: def, pro, hld, hlp, jud, wit.')
             self.pos = pos
+
+        def set_mod_call_delay(self):
+            self.mod_call_time = round(time.time() * 1000.0 + 30000)
+
+        def can_call_mod(self):
+            return (time.time() * 1000.0 - self.mod_call_time) > 0
 
     def __init__(self, server):
         self.clients = set()
@@ -231,7 +276,23 @@ class ClientManager:
             if client.get_ip() == ip:
                 clients.append(client)
         return clients
+	
+    def get_targets_by_hdid(self, hdid):
+        clients = []
+        for client in self.clients:
+            if client.get_hdid() == hdid:
+                clients.append(client)
+            return clients
 
+    def get_targets_by_hdidip(self, hdid, ip):
+        clients = []
+        for client in self.clients:
+            if client.get_ip() == ip:
+                clients.append(client)
+            if client.get_hdid() == hdid:
+                clients.append(client)
+        return clients
+		
     def get_targets_by_ooc_name(self, name):
         clients = []
         for client in self.clients:
@@ -254,3 +315,17 @@ class ClientManager:
         if ooc:
             return ooc
         return None
+
+    def get_muted_clients(self):
+        clients = []
+        for client in self.clients:
+            if client.is_muted:
+                clients.append(client)
+        return clients
+
+    def get_ooc_muted_clients(self):
+        clients = []
+        for client in self.clients:
+            if client.is_ooc_muted:
+                clients.append(client)
+        return clients
